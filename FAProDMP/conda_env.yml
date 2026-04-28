@@ -1,0 +1,19 @@
+channels:
+  - pytorch
+  - nvidia
+  - fair-robotics
+  - conda-forge
+  - defaults
+dependencies:
+    - python=3.9.0
+    - pandas
+    - numpy
+    - pytorch
+    # notebook
+    - jupyter
+    # MP_PyTorch dependencies
+    - matplotlib
+    # local packages
+    - pip
+    - pip:
+        - -e MP_PyTorch

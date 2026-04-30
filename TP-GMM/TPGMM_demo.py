@@ -14,16 +14,61 @@ import matplotlib.pyplot as plt
 
 from tqdm import tqdm
 
+urdf_path = r"urdf_files_dataset\urdf_files\oems\xacro_generated\franka_emika\franka_description\robots\panda\panda.urdf"
+import pinocchio as pin
+import numpy as np
+from pathlib import Path
 
+def get_ee_trajectory(urdf_path: str, joint_trajectory: np.ndarray, ee_frame_name: str = "panda_link7"):
+    """
+    Compute end-effector trajectory from joint positions.
 
-traj_label = 'dataset1'
-fig_dir = 'fig'
+    Args:
+        urdf_path:        path to franka_description URDF
+        joint_trajectory: (T, nq) array of joint positions [rad]
+        ee_frame_name:    name of the EE frame in the URDF
+
+    Returns:
+        positions:    (T, 3)    EE positions in world frame
+        orientations: (T, 3, 3) EE rotation matrices in world frame
+    """
+    # Load model
+    model = pin.buildModelFromUrdf(urdf_path)
+    data  = model.createData()
+
+    # Get the frame ID for the end effector
+    ee_frame_id = model.getFrameId(ee_frame_name)
+    if ee_frame_id == model.nframes:
+        available = [model.frames[i].name for i in range(model.nframes)]
+        raise ValueError(f"Frame '{ee_frame_name}' not found. Available frames:\n{available}")
+
+    positions    = []
+    orientations = []
+
+    for q in joint_trajectory:
+        q_pin = np.array(q, dtype=np.float64)
+
+        # Forward kinematics
+        pin.forwardKinematics(model, data, q_pin)
+        pin.updateFramePlacement(model, data, ee_frame_id)
+
+        T = data.oMf[ee_frame_id]   # SE3 transform: world <- EE
+        positions.append(T.translation.copy())
+        orientations.append(T.rotation.copy())
+
+    return np.array(positions), np.array(orientations)
+
+traj_label = 'dataset5'
+fig_dir = 'fig5'
 os.makedirs(fig_dir, exist_ok=True)
 nbDemos = 10
-T = 100
+T = 100#110#106#83#57
 frame_indices = [0, -1]
 nbFrames = len(frame_indices)
-POSITION_FEATURES = [ 'ee_pos_x', 'ee_pos_y', 'ee_pos_z' ]
+if traj_label != 'dataset6':
+    POSITION_FEATURES = [ 'px', 'py', 'pz']
+else:
+    POSITION_FEATURES = [ 'l1', 'l2', 'l3', 'l4', 'l5', 'l6', 'l7' ]
 nbStates = len(POSITION_FEATURES)
 
 def dataset1(nbDemos=1,seed=0,starts=None, ends=None):
@@ -255,6 +300,378 @@ def dataset5(nbDemos=1,seed=0,starts=None,ends=None):
         trajectories_list.append(base + offset + noise)
     return trajectories_list
 
+def dataset6(nbDemos=1,seed=0,starts=None,ends=None):
+    demo_dir = "arms_demos/D4/"
+    def preprocess_demos(
+        demo_dir: str = "arms_demo/D1",
+        file_prefix: str = "demo",
+        n_steps: int = 100,
+        vel_threshold: float = 0.01,
+        margin: int = 5,
+    ) -> np.ndarray:
+        """
+        Load and preprocess demonstration files recorded by DemoRecorder.
+
+        Steps:
+          1. Load all .npy demo files from demo_dir.
+          2. Trim leading/trailing samples where the robot is not moving
+             (all joint velocities below vel_threshold).
+          3. Resample each demo to exactly n_steps via linear interpolation.
+          4. Stack into a matrix of shape (n_demos, n_steps, n_joints).
+
+        Args:
+            demo_dir:       Directory containing the .npy demo files.
+            file_prefix:    Filename prefix used when saving (default "demo").
+            n_steps:        Number of timesteps every demo is resampled to.
+            vel_threshold:  A sample is considered "moving" if any joint velocity
+                            exceeds this value (rad/s).
+            margin:         Extra samples to keep on each side of the active window
+                            to avoid clipping the motion onset/offset.
+
+        Returns:
+            data: np.ndarray of shape (n_demos, n_steps, n_joints)
+                  containing joint positions only.
+        """
+        # ── 1. Collect files ──────────────────────────────────────────────────────
+        paths = [os.path.join(demo_dir, f"demo_00{i}.npy") for i in range(1,11)]
+
+        processed = []
+
+        for path in paths:
+            demo = np.load(path, allow_pickle=True).item()   # dict: time, pos, vel, acc
+            pos = np.array(demo["pos"])   # (T, n_joints)
+            vel = np.array(demo["vel"])   # (T, n_joints)
+            t   = np.array(demo["time"])  # (T,)
+
+            # Remove ur5 pos and vel
+            pos = pos[:,-9:-2]
+            vel = vel[:,-9:-2]
+
+            # ── 2. Trim silent regions ─────────────────────────────────────────
+            moving = np.linalg.norm(pos[1:]-pos[:-1],axis=1) > 1e-2  #np.any(np.abs(vel) > vel_threshold, axis=1)  # (T,) bool mask
+            if not moving.any():
+                print(f"  WARNING: {os.path.basename(path)} has no motion above "
+                      f"threshold={vel_threshold}. Skipping.")
+                continue
+            first = max(moving.argmax() - margin, 0)
+            last  = min(len(moving) - 1 - moving[::-1].argmax() + margin,len(moving) - 1)
+
+            pos_trim = pos[first:last + 1]   # (T', n_joints)
+            t_trim   = t[first:last + 1]     # (T',)
+            if len(t_trim) < 2:
+                print(f"  WARNING: {os.path.basename(path)} too short after trimming. Skipping.")
+                continue
+
+            # ── 3. Resample to n_steps via linear interpolation ────────────────
+            #t_norm   = (t_trim - t_trim[0]) / (t_trim[-1] - t_trim[0])  # [0, 1]
+            #t_target = np.linspace(0.0, 1.0, n_steps)
+    #
+            #interpolator = interp1d(t_norm, pos_trim, axis=0, kind="linear")
+            #pos_resampled = interpolator(t_target)  # (n_steps, n_joints)
+    #
+            #processed.append(pos_resampled)
+            #print(f"  {os.path.basename(path)}: {len(t)} → trimmed {len(t_trim)} "
+            #      f"→ resampled {n_steps} steps, {pos_resampled.shape[1]} joints.")
+            processed.append(pos_trim)
+
+        if not processed:
+            raise RuntimeError("No valid demos after preprocessing.")
+
+        # ── 4. Stack into (n_demos, n_steps, n_joints) ────────────────────────────
+        trimmed = []
+        target_len = min(d.shape[0] for d in processed)
+        for d in processed:
+            n = d.shape[0]
+            # pick target_len indices spread uniformly over [0, n-1]
+            idx = np.round(np.linspace(0, n - 1, target_len)).astype(int)
+            trimmed.append(d[idx])
+        data = np.stack(trimmed, axis=0)
+        print(f"\nFinal matrix shape: {data.shape}  "
+              f"(n_demos={data.shape[0]}, n_steps={data.shape[1]}, n_joints={data.shape[2]})")
+        return data
+    
+    def reconstruct_demo(mean_traj, W, z):
+        D, T = mean_traj.shape
+        mean_flat = mean_traj.reshape(-1)
+        x = mean_flat + z @ W
+        return x.reshape(D, T)
+    def sample_latent(Z):
+        z_mean = Z.mean(axis=0)
+        z_cov = np.cov(Z.T)
+        return np.random.multivariate_normal(z_mean, z_cov)
+    def sample_demo(mean_traj, W, Z):
+        z = sample_latent(Z)
+        return reconstruct_demo(mean_traj, W, z)
+    def sample_demos(mean_traj, W, Z, n_samples=5):
+        return [sample_demo(mean_traj, W, Z) for _ in range(n_samples)] #np.stack([sample_demo(mean_traj, W, Z) for _ in range(n_samples)])
+    def sample_demos_constrained(mean_traj, W, x_start, x_end, n_samples=5, eps=1e-6):
+        T, D = mean_traj.shape
+        mu = mean_traj.reshape(-1)
+        # trajectory covariance induced by latent model
+        Sigma_x = W.T @ W + eps * np.eye(T * D)
+        # observation matrix (start + end)
+        A = np.zeros((6, T * D))
+        A[:3, :3] = np.eye(3)
+        A[3:, -3:] = np.eye(3)
+        y = np.hstack([x_start, x_end])
+        # conditioning
+        Sigma_y = A @ Sigma_x @ A.T + eps * np.eye(6)
+        K = Sigma_x @ A.T @ np.linalg.inv(Sigma_y)
+        mu_cond = mu + K @ (y - A @ mu)
+        Sigma_cond = Sigma_x - K @ A @ Sigma_x
+        # sample trajectories in flat space
+        L = np.linalg.cholesky(Sigma_cond + eps * np.eye(T * D))
+        samples = []
+        for _ in range(n_samples):
+            x = mu_cond + L @ np.random.randn(T * D)
+            samples.append(x.reshape(T, D))
+        return samples #np.stack(samples)
+    def fit_latent_function(demos, latent_dim=20):
+        """
+        demos: (n_demos, n_joints, n_steps)
+        returns:
+            mean_traj: (n_steps, n_joints)   ← transposed back for downstream functions
+            W: (latent_dim, n_joints*n_steps)
+            Z: (n_demos, latent_dim)
+        """
+        n_demos, D, T = demos.shape
+
+        X = demos.reshape(n_demos, D * T)
+
+        mean_traj = X.mean(axis=0, keepdims=True)
+        X_centered = X - mean_traj
+
+        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+
+        W = Vt[:latent_dim]
+        Z = X_centered @ W.T
+
+        return mean_traj.reshape(D, T).T, W, Z
+    def dataset_from_real(demos: np.ndarray, nbDemos=1, starts=None, ends=None):
+        """
+        Args:
+            demos: np.ndarray of shape (n_demos, n_steps, n_joints)
+                   as returned by preprocess_demos()
+        """
+        # dataset3 expects (n_demos, n_features, n_steps) → transpose
+        demos_t = demos.transpose(0, 2, 1)   # (n_demos, n_joints, n_steps)
+
+        mean_traj, W, Z = fit_latent_function(demos_t)
+
+        if starts is None:
+            samples = sample_demos(mean_traj, W, Z, n_samples=nbDemos)
+        else:
+            samples = sample_demos_constrained(
+                mean_traj=mean_traj,
+                W=W,
+                x_start=starts.squeeze(),
+                x_end=ends.squeeze(),
+                n_samples=nbDemos
+            )
+
+        return samples
+    
+    demos = preprocess_demos(
+        demo_dir=demo_dir,
+        n_steps=100,          # target timeline length
+        vel_threshold=0.01,   # rad/s — tune to your robot's noise floor
+        margin=5,             # samples to keep around motion onset/offset
+    )
+    samples = dataset_from_real(demos, nbDemos)
+
+    if seed<10:
+        samples = []
+        for i in range(nbDemos):
+            samples.append(demos[seed-i])
+    return samples
+
+def dataset7(nbDemos=1,seed=0,starts=None,ends=None):
+    demo_dir = "arms_demos/D4/"
+    def preprocess_demos(
+        demo_dir: str = "arms_demo/D1",
+        file_prefix: str = "demo",
+        n_steps: int = 100,
+        vel_threshold: float = 0.01,
+        margin: int = 5,
+    ) -> np.ndarray:
+        """
+        Load and preprocess demonstration files recorded by DemoRecorder.
+
+        Steps:
+          1. Load all .npy demo files from demo_dir.
+          2. Trim leading/trailing samples where the robot is not moving
+             (all joint velocities below vel_threshold).
+          3. Resample each demo to exactly n_steps via linear interpolation.
+          4. Stack into a matrix of shape (n_demos, n_steps, n_joints).
+
+        Args:
+            demo_dir:       Directory containing the .npy demo files.
+            file_prefix:    Filename prefix used when saving (default "demo").
+            n_steps:        Number of timesteps every demo is resampled to.
+            vel_threshold:  A sample is considered "moving" if any joint velocity
+                            exceeds this value (rad/s).
+            margin:         Extra samples to keep on each side of the active window
+                            to avoid clipping the motion onset/offset.
+
+        Returns:
+            data: np.ndarray of shape (n_demos, n_steps, n_joints)
+                  containing joint positions only.
+        """
+        # ── 1. Collect files ──────────────────────────────────────────────────────
+        paths = [os.path.join(demo_dir, f"demo_00{i}.npy") for i in range(1,11)]
+
+        processed = []
+
+        for path in paths:
+            demo = np.load(path, allow_pickle=True).item()   # dict: time, pos, vel, acc
+            pos = np.array(demo["pos"])   # (T, n_joints)
+            vel = np.array(demo["vel"])   # (T, n_joints)
+            t   = np.array(demo["time"])  # (T,)
+
+            # Remove ur5 pos and vel
+            pos = pos[:,-9:-2]
+            vel = vel[:,-9:-2]
+
+            # ── 2. Trim silent regions ─────────────────────────────────────────
+            moving = np.linalg.norm(pos[1:]-pos[:-1],axis=1) > 1e-2  #np.any(np.abs(vel) > vel_threshold, axis=1)  # (T,) bool mask
+            if not moving.any():
+                print(f"  WARNING: {os.path.basename(path)} has no motion above "
+                      f"threshold={vel_threshold}. Skipping.")
+                continue
+            first = max(moving.argmax() - margin, 0)
+            last  = min(len(moving) - 1 - moving[::-1].argmax() + margin,len(moving) - 1)
+
+            pos_trim = pos[first:last + 1]   # (T', n_joints)
+            t_trim   = t[first:last + 1]     # (T',)
+            if len(t_trim) < 2:
+                print(f"  WARNING: {os.path.basename(path)} too short after trimming. Skipping.")
+                continue
+
+            # ── 3. Resample to n_steps via linear interpolation ────────────────
+            #t_norm   = (t_trim - t_trim[0]) / (t_trim[-1] - t_trim[0])  # [0, 1]
+            #t_target = np.linspace(0.0, 1.0, n_steps)
+    #
+            #interpolator = interp1d(t_norm, pos_trim, axis=0, kind="linear")
+            #pos_resampled = interpolator(t_target)  # (n_steps, n_joints)
+    #
+            #processed.append(pos_resampled)
+            #print(f"  {os.path.basename(path)}: {len(t)} → trimmed {len(t_trim)} "
+            #      f"→ resampled {n_steps} steps, {pos_resampled.shape[1]} joints.")
+            processed.append(pos_trim)
+
+        if not processed:
+            raise RuntimeError("No valid demos after preprocessing.")
+
+        # ── 4. Stack into (n_demos, n_steps, n_joints) ────────────────────────────
+        trimmed = []
+        target_len = min(d.shape[0] for d in processed)
+        print(target_len)
+        for d in processed:
+            n = d.shape[0]
+            # pick target_len indices spread uniformly over [0, n-1]
+            idx = np.round(np.linspace(0, n - 1, target_len)).astype(int)
+            trimmed.append(d[idx])
+        data = np.stack(trimmed, axis=0)
+        print(f"\nFinal matrix shape: {data.shape}  "
+              f"(n_demos={data.shape[0]}, n_steps={data.shape[1]}, n_joints={data.shape[2]})")
+        return data
+    
+    def reconstruct_demo(mean_traj, W, z):
+        D, T = mean_traj.shape
+        mean_flat = mean_traj.reshape(-1)
+        x = mean_flat + z @ W
+        return x.reshape(D, T)
+    def sample_latent(Z):
+        z_mean = Z.mean(axis=0)
+        z_cov = np.cov(Z.T)
+        return np.random.multivariate_normal(z_mean, z_cov)
+    def sample_demo(mean_traj, W, Z):
+        z = sample_latent(Z)
+        return reconstruct_demo(mean_traj, W, z)
+    def sample_demos(mean_traj, W, Z, n_samples=5):
+        return [sample_demo(mean_traj, W, Z) for _ in range(n_samples)] #np.stack([sample_demo(mean_traj, W, Z) for _ in range(n_samples)])
+    def sample_demos_constrained(mean_traj, W, x_start, x_end, n_samples=5, eps=1e-6):
+        T, D = mean_traj.shape
+        mu = mean_traj.reshape(-1)
+        # trajectory covariance induced by latent model
+        Sigma_x = W.T @ W + eps * np.eye(T * D)
+        # observation matrix (start + end)
+        A = np.zeros((6, T * D))
+        A[:3, :3] = np.eye(3)
+        A[3:, -3:] = np.eye(3)
+        y = np.hstack([x_start, x_end])
+        # conditioning
+        Sigma_y = A @ Sigma_x @ A.T + eps * np.eye(6)
+        K = Sigma_x @ A.T @ np.linalg.inv(Sigma_y)
+        mu_cond = mu + K @ (y - A @ mu)
+        Sigma_cond = Sigma_x - K @ A @ Sigma_x
+        # sample trajectories in flat space
+        L = np.linalg.cholesky(Sigma_cond + eps * np.eye(T * D))
+        samples = []
+        for _ in range(n_samples):
+            x = mu_cond + L @ np.random.randn(T * D)
+            samples.append(x.reshape(T, D))
+        return samples #np.stack(samples)
+    def fit_latent_function(demos, latent_dim=20):
+        """
+        demos: (n_demos, n_joints, n_steps)
+        returns:
+            mean_traj: (n_steps, n_joints)   ← transposed back for downstream functions
+            W: (latent_dim, n_joints*n_steps)
+            Z: (n_demos, latent_dim)
+        """
+        n_demos, D, T = demos.shape
+
+        X = demos.reshape(n_demos, D * T)
+
+        mean_traj = X.mean(axis=0, keepdims=True)
+        X_centered = X - mean_traj
+
+        U, S, Vt = np.linalg.svd(X_centered, full_matrices=False)
+
+        W = Vt[:latent_dim]
+        Z = X_centered @ W.T
+
+        return mean_traj.reshape(D, T).T, W, Z
+    def dataset_from_real(demos: np.ndarray, nbDemos=1, starts=None, ends=None):
+        """
+        Args:
+            demos: np.ndarray of shape (n_demos, n_steps, n_joints)
+                   as returned by preprocess_demos()
+        """
+        # dataset3 expects (n_demos, n_features, n_steps) → transpose
+        demos_t = demos.transpose(0, 2, 1)   # (n_demos, n_joints, n_steps)
+
+        mean_traj, W, Z = fit_latent_function(demos_t)
+
+        if starts is None:
+            samples = sample_demos(mean_traj, W, Z, n_samples=nbDemos)
+        else:
+            samples = sample_demos_constrained(
+                mean_traj=mean_traj,
+                W=W,
+                x_start=starts.squeeze(),
+                x_end=ends.squeeze(),
+                n_samples=nbDemos
+            )
+
+        return samples
+    
+    demos = preprocess_demos(
+        demo_dir=demo_dir,
+        n_steps=100,          # target timeline length
+        vel_threshold=0.01,   # rad/s — tune to your robot's noise floor
+        margin=5,             # samples to keep around motion onset/offset
+    )
+    samples = dataset_from_real(demos, nbDemos)
+    samples_pee = [get_ee_trajectory(urdf_path, samples[i])[0] for i in range(nbDemos)]
+    if seed<10:
+        samples_pee = []
+        for i in range(nbDemos):
+            samples_pee.append(get_ee_trajectory(urdf_path, demos[seed-i])[0])
+    return samples_pee
+
+
 def create_dataset(traj_label, nbDemos=1, seed=0,starts=None,ends=None):
     # Create demo dataset
     if traj_label == 'dataset5':
@@ -267,12 +684,15 @@ def create_dataset(traj_label, nbDemos=1, seed=0,starts=None,ends=None):
         return dataset2(nbDemos=nbDemos, seed=seed,starts=starts,ends=ends)
     elif traj_label == "dataset3":
         return dataset3(nbDemos=nbDemos, seed=seed,starts=starts,ends=ends)
-
+    elif traj_label == "dataset6":
+        return dataset6(nbDemos=nbDemos, seed=seed,starts=starts,ends=ends)
+    elif traj_label == "dataset7":
+        return dataset7(nbDemos=nbDemos, seed=seed,starts=starts,ends=ends)
     
 trajectories = np.array(create_dataset(traj_label, nbDemos))
 
 # Plot demo
-fig, axs = plt.subplots(2, nbStates, figsize=(5*nbStates,3 * 2))
+fig, axs = plt.subplots(2, nbStates, figsize=(5*nbStates,nbStates * 2))
 fig.suptitle('Demonstrations')
 plt.subplots_adjust(hspace=0.5)
 for feature_idx in range(nbStates):
@@ -283,13 +703,13 @@ plt.show()
 
 # Create local demo
 translations = np.stack([np.stack([-traj[f_idx] for f_idx in frame_indices]) for traj in trajectories])
-rotations = np.tile(np.eye(3), (nbDemos, nbFrames, 1, 1))
+rotations = np.tile(np.eye(nbStates), (nbDemos, nbFrames, 1, 1))
 local_trajectories = transform_into_frames(trajectories, translations, rotations)
 
 # Plot local demo
-fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+fig, axes = plt.subplots(2, nbStates, figsize=(15, 8))
 for f in range(len(frame_indices)):  # frames
-    for dim in range(3):  # x, y, z
+    for dim in range(nbStates):  # x, y, z
         ax = axes[f, dim]
         for n in range(nbDemos):  # demos
             ax.plot(local_trajectories[n, f, :, dim], label=f'Demo {n}')
@@ -314,7 +734,7 @@ concat_data = np.concatenate(local_with_time, axis=1)
 print(f"Concatenated data shape: {concat_data.shape}")
 
 # Compute optimal number of component (BIC score)
-K = np.arange(3, 7)
+K = np.arange(3, 14) #7
 bic_scores = []
 for k in tqdm(K):
     model = TPGMM(n_components=k, reg_factor=1e-4)
@@ -325,7 +745,7 @@ tpgmm = TPGMM(n_components=best_k, reg_factor=1e-4, verbose=False)
 tpgmm.fit(concat_data)
 
 # Sanity checks
-print("SC1 - Time means (should span 0 to 1):", np.sort(tpgmm.means_[0, :, 3]))
+print("SC1 - Time means (should span 0 to 1):", np.sort(tpgmm.means_[0, :, nbStates]))
 print("SC2 - Weights (should not be near zero):", tpgmm.weights_)
 
 # Check condition numbers of covariances
@@ -376,16 +796,16 @@ for k in range(best_k):
 
 
 
-gmr = GaussianMixtureRegression.from_tpgmm(tpgmm, input_idx=[3])
+gmr = GaussianMixtureRegression.from_tpgmm(tpgmm, input_idx=[nbStates])
 
 
 print('----- Test reproduce demo -----')
 query_translations = np.stack([trajectories[0][f_idx] for f_idx in frame_indices])
-query_rotations = np.eye(3)[None].repeat(nbFrames, axis=0)
+query_rotations = np.eye(nbStates)[None].repeat(nbFrames, axis=0)
 gmr.fit(translation=query_translations, rotation_matrix=query_rotations)
 
 
-fig, axes = plt.subplots(2, 3, figsize=(15, 8))
+fig, axes = plt.subplots(2, nbStates, figsize=(15, 8))
 h = gmr._h(input_data)
 labels = np.argmax(h, axis=1) 
 print("Weights:", gmr.gmm_weights)
@@ -417,119 +837,130 @@ plt.show()
 
 
 mu_orig, cov_orig = gmr.predict(input_data)
-
 fig, ax = scatter(title="Reconstructed Trajectory (NumPy TPGMM + NumPy GMR)", data=query_translations[:, None])
-fig, ax = plot_trajectories(trajectories=mu_orig[None], fig=fig, ax=ax, legend=True)
+fig, ax = plot_trajectories(trajectories=trajectories, fig=fig, ax=ax, legend=True)
+plt.show()
+#fig, ax = plot_trajectories(trajectories=mu_orig[None], fig=fig, ax=ax, legend=True)
 print(f"Distance to start: {np.linalg.norm(query_translations[0] - mu_orig[0]):.4f}")
 print(f"Distance to end: {np.linalg.norm(trajectories[0][-1] - mu_orig[-1]):.4f}")
 
-def test(query_translations, frame_indices, name, original_traj=None, query_rotations=None):
+def test(query_translations, frame_indices, name, original_traj=None, query_rotations=None, plot_flag=1):
     if query_rotations is None:
-        query_rotations = np.eye(3)[None].repeat(nbFrames, axis=0)
-    if traj_label == 'dataset1' or traj_label == 'dataset2':
-        ends = np.array([0.4, 0.2, 0.4])
-        starts = np.array([-0.6, -0.2, -0.6])
-    elif traj_label == 'dataset3':
-        starts = np.array([-0.8, -1, -0.8])
-        ends = np.array([-0.25, 1, 0.25])
-    elif traj_label == 'dataset4' or  traj_label == 'dataset5':
-        starts=np.array([1, 0, 0])
-        ends=np.array([1, 0, 1])
+        query_rotations = np.eye(nbStates)[None].repeat(nbFrames, axis=0)
 
     gmr.fit(translation=query_translations, rotation_matrix=query_rotations)
     mu_, cov_ = gmr.predict(input_data)
 
     times = np.linspace(0,1,T)
-    POSITION_FEATURES = [ 'ee_pos_x', 'ee_pos_y', 'ee_pos_z' ]
     STD_SCALE = 2
     num_pos_dof = nbStates
-    fig, axs = plt.subplots(1, num_pos_dof, figsize=(5 * num_pos_dof, 4))
-    fig.suptitle(f'ProDMP – {name}')
-    for feature_idx, feature_name in enumerate(POSITION_FEATURES):
-        ax = axs[feature_idx]
-        #if feature_idx == 2:
-        #    ax.set_title('plane xy')
-#
-        #    for ii in range(nbDemos):
-        #        ax.plot(trajectories[ii,:,0], trajectories[ii,:,1], color='k', alpha=0.1)
-#
-        #    # original
-        #    #ax.plot(mu_orig[:,0], mu_orig[:,1], color='blue', label='original')
-#
-        #    # shifted
-        #    ax.plot(mu_[:,0], mu_[:,1], color='orange', label='shifted')
-#
-        #    if original_traj is not None:
-        #        ax.plot(original_traj[0][:,0], original_traj[0][:,1], color='green', label='demo')
-#
-        #    # mark new start
-        #    for query_translations_i in query_translations:
-        #        ax.plot(query_translations_i[0], query_translations_i[1],
-        #                 'x',ms=10)
-        #    ax.legend()
-        #    continue
-        
-        ax.set_title(feature_name)
 
-        # original
-        #mean_orig_np    = mu_orig[:, feature_idx]
-        #std_orig_np     = np.sqrt(cov_orig[:, feature_idx, feature_idx])
-        #ax.fill_between(times,
-        #                mean_orig_np - STD_SCALE * std_orig_np,
-        #                mean_orig_np + STD_SCALE * std_orig_np,
-        #                color='blue', alpha=0.3)
-        #ax.plot(times, mean_orig_np, color='blue', label='original')
+    if plot_flag:
+        fig, axs = plt.subplots(1, num_pos_dof, figsize=(5 * num_pos_dof, 4))
+        fig.suptitle(f'TP-GMM – {name}')
+        for feature_idx, feature_name in enumerate(POSITION_FEATURES):
+            ax = axs[feature_idx]
+            ax.set_title(feature_name)
 
-        # shifted
-        mean_shifted_np = mu_[:, feature_idx]
-        std_shifted_np  = np.sqrt(cov_[:, feature_idx, feature_idx])
-        ax.fill_between(times,
-                        mean_shifted_np - STD_SCALE * std_shifted_np,
-                        mean_shifted_np + STD_SCALE * std_shifted_np,
-                        color='orange', alpha=0.3)
-        ax.plot(times, mean_shifted_np, color='orange', label='shifted')
+            # shifted
+            mean_shifted_np = mu_[:, feature_idx]
+            std_shifted_np  = np.sqrt(cov_[:, feature_idx, feature_idx])
+            ax.fill_between(times,
+                            mean_shifted_np - STD_SCALE * std_shifted_np,
+                            mean_shifted_np + STD_SCALE * std_shifted_np,
+                            color='orange', alpha=0.3)
+            ax.plot(times, mean_shifted_np, color='orange', label='shifted')
 
-        if original_traj is not None:
-            ax.plot(times, original_traj[0][:,feature_idx], color='green', label='demo')
-        
-        # mark new start
-        for (MEASUREMENT_PHASE_IDX_i, query_translations_i) in zip(frame_indices, query_translations):
-            ax.plot(times[MEASUREMENT_PHASE_IDX_i], query_translations_i[feature_idx].item(),
-                    'x', ms=10)
-        ax.legend()
+            if original_traj is not None:
+                ax.plot(times, original_traj[0][:,feature_idx], color='green', label='demo')
 
-        ax.scatter(times[0], starts[feature_idx],
-            s=50,
-            label=f"mean starts demo",
-            c='k',)
-        ax.scatter(times[-1], ends[feature_idx],
-            s=50,
-            label=f"mean ends demo",
-            c='k',)
-        ax.scatter(times[-1], ends[feature_idx]+0.5,
-            s=50,
-            label=f"mean+scale ends demo",
-            marker='+',
-            c='k',)
-        ax.scatter(times[-1], ends[feature_idx]-0.5,
-            s=50,
-            label=f"mean+scale ends demo",
-            marker='+',
-            c='k',)
-        
-        ax.set_ylim([-1.5,1.5])
-    plt.tight_layout()
+            # mark new start
+            for (MEASUREMENT_PHASE_IDX_i, query_translations_i) in zip(frame_indices, query_translations):
+                ax.plot(times[MEASUREMENT_PHASE_IDX_i], query_translations_i[feature_idx].item(),
+                        'x', ms=10)
+            ax.legend()
 
-    plt.savefig(f'{fig_dir}/{name}.png')
+            if traj_label != 'dataset6' and traj_label != 'dataset7':
+                if traj_label == 'dataset1' or traj_label == 'dataset2':
+                    ends = np.array([0.4, 0.2, 0.4])
+                    starts = np.array([-0.6, -0.2, -0.6])
+                elif traj_label == 'dataset3':
+                    starts = np.array([-0.8, -1, -0.8])
+                    ends = np.array([-0.25, 1, 0.25])
+                elif traj_label == 'dataset4' or  traj_label == 'dataset5':
+                    starts=np.array([1, 0, 0])
+                    ends=np.array([1, 0, 1])
+
+                ax.scatter(times[0], starts[feature_idx],
+                    s=50,
+                    label=f"mean starts demo",
+                    c='k',)
+                ax.scatter(times[-1], ends[feature_idx],
+                    s=50,
+                    label=f"mean ends demo",
+                    c='k',)
+                ax.scatter(times[-1], ends[feature_idx]+0.5,
+                    s=50,
+                    label=f"mean+scale ends demo",
+                    marker='+',
+                    c='k',)
+                ax.scatter(times[-1], ends[feature_idx]-0.5,
+                    s=50,
+                    label=f"mean+scale ends demo",
+                    marker='+',
+                    c='k',)
+
+                ax.set_ylim([-1.5,1.5])
+
+        plt.tight_layout()
+
+        plt.savefig(f'{fig_dir}/{name}.png')
+        plt.close()
 
     #fig, ax = scatter(title="Reconstructed Trajectory (NumPy TPGMM + NumPy GMR)", data=query_translations[:, None])
     #fig, ax = plot_trajectories(trajectories=mu_[None], fig=fig, ax=ax, legend=True)
     #plot_trajectories(title="Demo Trajectories", trajectories=trajectories, fig=fig, ax=ax, show=True, alpha=0.3)
     #plot_ellipsoids(means=mu_[::10], covs=cov_[::10], fig=fig, ax=ax, color="k", alpha=0.3, show=True)
 
-    print(query_translations.shape, mu_.shape)
     print(f"Distance to start: {np.linalg.norm(query_translations[0] - mu_[0]):.4f}")
     print(f"Distance to end: {np.linalg.norm(query_translations[-1] - mu_[-1]):.4f}")
+
+    return mu_
+
+###############################################################################
+if traj_label == 'dataset6':
+    fig, axs = plt.subplots(2, 5)
+    trajectories_demo = create_dataset(traj_label, nbDemos=10)
+    pos_ref = [get_ee_trajectory(urdf_path, trajectories_demo[i])[0] for i in range(10)]
+    pos_tpgmm = [get_ee_trajectory(urdf_path, test(np.array([trajectories_demo[i][0], trajectories_demo[i][-1]]), frame_indices, 'traj_new_s', original_traj=trajectories_demo[i], plot_flag=0))[0] for i in range(10)]
+    for ii in range(10):
+        for jj in range(10):
+            axs[ii//5,ii%5].plot(pos_ref[jj][:,0],pos_ref[jj][:,1], alpha=0.3)
+        axs[ii//5,ii%5].plot(pos_tpgmm[ii][:,0],pos_tpgmm[ii][:,1], label='TPGMM')
+        axs[ii//5,ii%5].scatter(pos_tpgmm[ii][frame_indices,0],pos_tpgmm[ii][frame_indices,1], s=50)
+    plt.legend()
+    plt.show()
+
+    fig, ax = scatter(title="Reconstructed Trajectory (NumPy TPGMM + NumPy GMR)", data=np.array([trajectories_demo[0][0], trajectories_demo[0][-1]])[:, None])
+    fig, ax = plot_trajectories(trajectories=pos_tpgmm, fig=fig, ax=ax, legend=True)
+    plot_trajectories(trajectories=pos_ref, fig=fig, ax=ax, legend=True)
+    plot_trajectories(title="Demo Trajectories", trajectories=pos_ref, fig=fig, ax=ax, show=True, alpha=0.3)
+if traj_label == 'dataset7':
+    fig, axs = plt.subplots(2, 5)
+    pos_ref = create_dataset(traj_label, nbDemos=10)
+    pos_tpgmm = [test(np.array([pos_ref[i][0], pos_ref[i][-1]]), frame_indices, 'traj_new_s', original_traj=pos_ref[i], plot_flag=0) for i in range(10)]
+    for ii in range(10):
+        for jj in range(10):
+            axs[ii//5,ii%5].plot(pos_ref[jj][:,0],pos_ref[jj][:,1], alpha=0.3)
+        axs[ii//5,ii%5].plot(pos_tpgmm[ii][:,0],pos_tpgmm[ii][:,1], label='TPGMM')
+        axs[ii//5,ii%5].scatter(pos_tpgmm[ii][frame_indices,0],pos_tpgmm[ii][frame_indices,1], s=50)
+    plt.legend()
+    plt.show()
+
+    fig, ax = scatter(title="Reconstructed Trajectory (NumPy TPGMM + NumPy GMR)", data=np.array([pos_ref[0][0], pos_ref[0][-1]])[:, None])
+    fig, ax = plot_trajectories(trajectories=pos_tpgmm, fig=fig, ax=ax, legend=True)
+    plot_trajectories(trajectories=pos_ref, fig=fig, ax=ax, legend=True)
+    plot_trajectories(title="Demo Trajectories", trajectories=pos_ref, fig=fig, ax=ax, show=True, alpha=0.3)
 
 ###############################################################################
 print('----- Test with new y0 and g (same generators) -----')
@@ -574,12 +1005,16 @@ elif traj_label == 'dataset4':
     traj_mean = dataset4(starts=np.array([1, 0, 0]),ends=np.array([1, 0, 1]))
 elif traj_label == 'dataset5':
     traj_mean = dataset5(starts=np.array([-0., 0, -0.]),ends=np.array([0, 0, 0])) #*0 the starts and ends in trajectory
+elif traj_label == 'dataset6':
+    traj_mean = dataset6(seed=0)
+elif traj_label == 'dataset7':
+    traj_mean = dataset7(seed=0)
 
 ###############################################################################
 print('----- Test with shifted initial position 0.05 -----')
 
 query_translations = np.array([
-    traj_mean[0][0] + np.array([0.05,0.05,0.05]),
+    traj_mean[0][0] + 0.05*np.ones(nbStates), #np.array([0.05,0.05,0.05]),
     traj_mean[0][-1],
 ])
 
@@ -591,7 +1026,7 @@ test(query_translations, frame_indices, 'y0_1', original_traj=trajectory)
 print('----- Test with shifted initial position 0.1 -----')
 
 query_translations = np.array([
-    traj_mean[0][0] + np.array([0.1,0.1,0.1]),
+    traj_mean[0][0] + 0.1*np.ones(nbStates),# + np.array([0.1,0.1,0.1]),
     traj_mean[0][-1],
 ])
 
@@ -603,7 +1038,7 @@ test(query_translations, frame_indices, 'y0_2', original_traj=trajectory)
 print('----- Test with shifted initial position 0.5 -----')
 
 query_translations = np.array([
-    traj_mean[0][0] + np.array([0.5,0.5,0.5]),
+    traj_mean[0][0] +  + 0.5*np.ones(nbStates),#np.array([0.5,0.5,0.5]),
     traj_mean[0][-1],
 ])
 
@@ -617,7 +1052,7 @@ print('----- Test with shifted goal position 0.05 -----')
 
 query_translations = np.array([
     traj_mean[0][0],
-    traj_mean[0][-1] + np.array([0.05,0.05,0.05]),
+    traj_mean[0][-1]  + 0.05*np.ones(nbStates) #+ np.array([0.05,0.05,0.05]),
 ])
 
 trajectory = np.array(create_dataset(traj_label,starts=np.array([query_translations[0]]),ends=np.array([query_translations[1]])))
@@ -630,7 +1065,7 @@ print('----- Test with shifted goal position 0.1 -----')
 
 query_translations = np.array([
     traj_mean[0][0],
-    traj_mean[0][-1] + np.array([0.1,0.1,0.1]),
+    traj_mean[0][-1]  + 0.1*np.ones(nbStates)#+ np.array([0.1,0.1,0.1]),
 ])
 
 trajectory = np.array(create_dataset(traj_label,starts=np.array([query_translations[0]]),ends=np.array([query_translations[1]])))
@@ -643,7 +1078,7 @@ print('----- Test with shifted goal position 0.5 -----')
 
 query_translations = np.array([
     traj_mean[0][0],
-    traj_mean[0][-1] + np.array([0.5,0.5,0.5]),
+    traj_mean[0][-1]  + 0.5*np.ones(nbStates)#+ np.array([0.5,0.5,0.5]),
 ])
 
 trajectory = np.array(create_dataset(traj_label,starts=np.array([query_translations[0]]),ends=np.array([query_translations[1]])))

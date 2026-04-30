@@ -54,11 +54,11 @@ def scatter(
     for frame_idx, (cluster, c) in enumerate(zip(data, color)):
         ax.scatter3D(
             *(cluster.T),
-            s=50,
+            #s=50,
             label=f"frame: {frame_idx}",
             alpha=alpha,
             marker=marker,
-            c=c,
+            #c=c,
         )
 
     return ax
